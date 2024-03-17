@@ -39,6 +39,7 @@ curses.init_pair(6, curses.COLOR_GREEN, curses.COLOR_BLACK)
 curses.init_pair(7, curses.COLOR_RED, curses.COLOR_BLACK)
 
 BLOCK = "[ ]"
+CUDA = False
 EMPTY = " . "
 grid = [[0] * WIDTH for _ in range(HEIGHT)]
 current_piece = random.choice(SHAPES)
@@ -61,13 +62,13 @@ class TetrisModel(nn.Module):
         super(TetrisModel, self).__init__()
         
         self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0], 32, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(input_shape[0], 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(64, 512, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
+            nn.Conv2d(512, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
             nn.ReLU()
@@ -110,12 +111,19 @@ def train_model():
     if len(replay_buffer) < BATCH_SIZE:
         return
     state, action, reward, next_state, done = replay_buffer.sample(BATCH_SIZE)
-    state = torch.stack(state).to('cuda:0')
-    next_state = torch.stack(next_state).to('cuda:0')
-    action = torch.tensor(action).to('cuda:0')
-    reward = torch.tensor(reward).to('cuda:0')
-    done = torch.tensor(done).to('cuda:0')
-
+    if CUDA:
+        state = torch.stack(state).to('cuda:0')
+        next_state = torch.stack(next_state).to('cuda:0')
+        action = torch.tensor(action).to('cuda:0')
+        reward = torch.tensor(reward).to('cuda:0')
+        done = torch.tensor(done).to('cuda:0')
+    else:
+        state = torch.stack(state)
+        next_state = torch.stack(next_state)
+        action = torch.tensor(action)
+        reward = torch.tensor(reward)
+        done = torch.tensor(done)
+        
     current_q = model(state).gather(1, action.unsqueeze(1))
     max_next_q = model(next_state).max(1)[0].detach()
     expected_q = reward + (1 - done) * GAMMA * max_next_q
@@ -135,13 +143,16 @@ def board_to_state(board):
 def choose_action(model, state, epsilon):
     actions = [0, 1, 2, 3, 4, 5, 6]
 
-    if random.random() < epsilon:
+    if random.randint(0, 1) < epsilon:
         # Exploration: choose a random action
         return random.choice(actions)
     else:
         # Exploitation: choose the best action according to the model
         with torch.no_grad():
-            q_values = model(state.to('cuda:0'))
+            if CUDA:
+                q_values = model(state.to('cuda:0'))
+            else:
+                q_values = model(state)
             action_index = torch.argmax(q_values).item()
             return actions[action_index]
 
@@ -338,23 +349,24 @@ if AI_PLAY == False:
         elif key == curses.KEY_RIGHT:
             if can_place(current_piece, current_x + 1, current_y):
                 current_x += 1
-        elif key == ord('s'):
-            swap_piece()
         elif key == curses.KEY_LEFT:
             if can_place(current_piece, current_x - 1, current_y):
                 current_x -= 1
-        elif key == curses.KEY_DOWN:
-            fall_speed += -90
-            speed_up_counter = 0
-            fall_speed += 90
-        elif key == ord(' '):
-            while can_place(current_piece, current_x, current_y + 1):
-                current_y += 1
-            fall_speed = last_fall_speed
         elif key == curses.KEY_UP:
             rotated_piece = rotate_piece(current_piece)
             if can_place(rotated_piece, current_x, current_y):
                 current_piece = rotated_piece
+        elif key == curses.KEY_DOWN:
+            fall_speed += -90
+            speed_up_counter = 0
+            fall_speed += 90
+        elif key == ord('s'):
+            swap_piece()
+        elif key == ord(' '):
+            while can_place(current_piece, current_x, current_y + 1):
+                current_y += 1
+            fall_speed = last_fall_speed
+
 
         if fall_counter >= fall_speed / 10:
             if can_place(current_piece, current_x, current_y + 1):
@@ -416,7 +428,8 @@ else:
     EPSILON_END = 0.01
     EPSILON_DECAY = 0.995
     model = TetrisModel((1, HEIGHT, WIDTH))
-    model = model.to('cuda:0')
+    if CUDA:
+        model = model.to('cuda:0')
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
     replay_buffer = ReplayBuffer()
@@ -450,36 +463,31 @@ else:
 
 
             # Update the last move time whenever a key is pressed
-            # if key == ord('q'):
-            #     pygame.mixer.music.stop()
-            #     break
-            
             if key in [5, 3, 2, 1]:
                 last_move_time = time.time()
     
 
-        
-            if key == 5:
+            if key == 0: # Go right
                 if can_place(current_piece, current_x + 1, current_y):
                     current_x += 1
-            elif key == 1:
-                swap_piece()
-            elif key == 4:
+            elif key == 1: # Go left
                 if can_place(current_piece, current_x - 1, current_y):
                     current_x -= 1
-            elif key == 3:
-                fall_speed += -90
-                speed_up_counter = 0
-                fall_speed += 90
-            elif key == 0:
-                while can_place(current_piece, current_x, current_y + 1):
-                    current_y += 1
-                fall_speed = last_fall_speed
-            elif key == 2:
+            elif key == 2: # Rotate piece
                 rotated_piece = rotate_piece(current_piece)
                 if can_place(rotated_piece, current_x, current_y):
                     current_piece = rotated_piece
-            
+            elif key == 3: # Soft-drop
+                fall_speed += -90
+                speed_up_counter = 0
+                fall_speed += 90
+            elif key == 4: # Switch piece
+                swap_piece()
+            elif key == 5: # Hard-drop
+                while can_place(current_piece, current_x, current_y + 1):
+                    current_y += 1
+                fall_speed = last_fall_speed
+
             # if fall_counter >= fall_speed / 10:
             if 1 == 1:
                 if can_place(current_piece, current_x, current_y + 1):
