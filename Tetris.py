@@ -10,7 +10,6 @@ import numpy as np
 # pygame.mixer.init()
 # pygame.mixer.music.load('background_music.mp3')
 # pygame.mixer.music.play(-1)
-
 stdscr = curses.initscr()
 curses.start_color()
 curses.curs_set(0)
@@ -39,7 +38,7 @@ curses.init_pair(6, curses.COLOR_GREEN, curses.COLOR_BLACK)
 curses.init_pair(7, curses.COLOR_RED, curses.COLOR_BLACK)
 
 BLOCK = "[ ]"
-CUDA = False
+CUDA = True
 EMPTY = " . "
 grid = [[0] * WIDTH for _ in range(HEIGHT)]
 current_piece = random.choice(SHAPES)
@@ -143,7 +142,7 @@ def board_to_state(board):
 def choose_action(model, state, epsilon):
     actions = [0, 1, 2, 3, 4, 5, 6]
 
-    if random.randint(0, 1) < epsilon:
+    if random.random() < epsilon:
         # Exploration: choose a random action
         return random.choice(actions)
     else:
@@ -157,18 +156,40 @@ def choose_action(model, state, epsilon):
             return actions[action_index]
 
 def reward_function(board, lines_cleared):
-    # Define rewards
-    game_over_penalty = -3  # Penalty for losing the game
-
-    # Calculate reward
-    reward = lines_cleared * 10
-
-    # Apply game over penalty if the game is over
+    # Simple reward constants
+    line_clear_reward = 100  # Reward per line cleared
+    hole_penalty = -50  # Penalty for each hole in the stack
+    height_penalty = -1  # Penalty for increasing the height of the stack
+    game_over_penalty = -10000  # Large penalty for ending the game
+    
+    # Calculate rewards and penalties
+    reward = lines_cleared * line_clear_reward
+    penalty = count_holes(board) * hole_penalty + calculate_height_penalty(board) * height_penalty
+    
+    # Check for game over state to apply a significant penalty
     if is_game_over():
-        reward += game_over_penalty
-    reward += -1
+        penalty += game_over_penalty
+    
+    # The final reward is a sum of all components
+    return reward + penalty
 
-    return reward
+def calculate_height_penalty(grid):
+    # Sum of the heights of all columns, penalizing higher stacks
+    return sum(max((row_idx + 1 for row_idx, cell in enumerate(col) if cell > 0), default=0) for col in zip(*grid))
+
+def count_holes(grid):
+    # Count all empty cells that have at least one block above them in each column
+    holes = 0
+    for col in zip(*grid):
+        block_found = False
+        for cell in col:
+            if cell > 0:
+                block_found = True
+            elif block_found and cell == 0:
+                holes += 1
+    return holes
+
+
 
 def can_place(piece, x, y):
     _, shape = piece
@@ -420,21 +441,25 @@ if AI_PLAY == False:
 
 else:
     # Hyperparameters
-    EPISODES = 1000
+    EPISODES = 10000
     BATCH_SIZE = 32
-    LEARNING_RATE = 0.01
-    GAMMA = 0.99
+    LEARNING_RATE = 0.1
+    GAMMA = 0.95
     EPSILON_START = 1.0
     EPSILON_END = 0.01
     EPSILON_DECAY = 0.995
     model = TetrisModel((1, HEIGHT, WIDTH))
+    try:
+        model.load_state_dict(torch.load('model_state_dict.pth'))
+    except Exception as e:
+        print("Tried to load model, failed: {e}")
     if CUDA:
         model = model.to('cuda:0')
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     criterion = nn.MSELoss()
     replay_buffer = ReplayBuffer()
     epsilon = EPSILON_START
-    for i in range(100000):
+    for i in range(EPISODES):
 
 
 
@@ -554,8 +579,9 @@ else:
                 w.refresh()
 
                 if is_game_over():
-                    reward += -1000
                     epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
                     train_model()
 
                     break
+    torch.save(model.state_dict(), 'model_state_dict.pth')
+    print("Saved model in 'model_state_dict.pth'")
