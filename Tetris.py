@@ -45,7 +45,7 @@ current_piece = random.choice(SHAPES)
 current_x = WIDTH // 2
 current_y = 0
 score = 0
-fall_speed = 70  
+fall_speed = 40
 last_fall_speed = fall_speed
 lines_cleared = 0
 fall_counter = 0
@@ -64,8 +64,6 @@ class TetrisModel(nn.Module):
             nn.Conv2d(input_shape[0], 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(64, 512, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.Conv2d(512, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
@@ -157,37 +155,20 @@ def choose_action(model, state, epsilon):
 
 def reward_function(board, lines_cleared):
     # Simple reward constants
-    line_clear_reward = 100  # Reward per line cleared
-    hole_penalty = -50  # Penalty for each hole in the stack
-    height_penalty = -1  # Penalty for increasing the height of the stack
-    game_over_penalty = -10000  # Large penalty for ending the game
+    background_reward = -1
+    line_clear_reward = 10  # Reward per line cleared
+    game_over_penalty = -100  # Large penalty for ending the game
     
     # Calculate rewards and penalties
     reward = lines_cleared * line_clear_reward
-    penalty = count_holes(board) * hole_penalty + calculate_height_penalty(board) * height_penalty
+    if reward == 0:
+        reward += -1
     
     # Check for game over state to apply a significant penalty
     if is_game_over():
-        penalty += game_over_penalty
+        reward += game_over_penalty
     
-    # The final reward is a sum of all components
-    return reward + penalty
-
-def calculate_height_penalty(grid):
-    # Sum of the heights of all columns, penalizing higher stacks
-    return sum(max((row_idx + 1 for row_idx, cell in enumerate(col) if cell > 0), default=0) for col in zip(*grid))
-
-def count_holes(grid):
-    # Count all empty cells that have at least one block above them in each column
-    holes = 0
-    for col in zip(*grid):
-        block_found = False
-        for cell in col:
-            if cell > 0:
-                block_found = True
-            elif block_found and cell == 0:
-                holes += 1
-    return holes
+    return reward
 
 
 
@@ -442,8 +423,8 @@ if AI_PLAY == False:
 else:
     # Hyperparameters
     EPISODES = 10000
-    BATCH_SIZE = 32
-    LEARNING_RATE = 0.1
+    BATCH_SIZE = 64
+    LEARNING_RATE = 0.2
     GAMMA = 0.95
     EPSILON_START = 1.0
     EPSILON_END = 0.01
@@ -452,7 +433,7 @@ else:
     try:
         model.load_state_dict(torch.load('model_state_dict.pth'))
     except Exception as e:
-        print("Tried to load model, failed: {e}")
+        print(f"Tried to load model, failed: {e}")
     if CUDA:
         model = model.to('cuda:0')
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
