@@ -5,11 +5,9 @@ from collections import deque
 import curses
 import time
 import numpy as np
-# import pygame.mixer
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
 
-# pygame.mixer.init()
-# pygame.mixer.music.load('background_music.mp3')
-# pygame.mixer.music.play(-1)
 stdscr = curses.initscr()
 curses.start_color()
 curses.curs_set(0)
@@ -45,7 +43,7 @@ current_piece = random.choice(SHAPES)
 current_x = WIDTH // 2
 current_y = 0
 score = 0
-fall_speed = 40
+fall_speed = 100
 last_fall_speed = fall_speed
 lines_cleared = 0
 fall_counter = 0
@@ -55,29 +53,26 @@ AI_PLAY = True
 landing_timestamp = None
 lines_cleared_at_once = 0
 
-
 class TetrisModel(nn.Module):
     def __init__(self, input_shape):
         super(TetrisModel, self).__init__()
         
         self.conv = nn.Sequential(
-            nn.Conv2d(input_shape[0], 64, kernel_size=4, stride=2, padding=1),
+            nn.Conv2d(1, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.Conv2d(64, 512, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),
-            nn.ReLU()
         )
         
-        # Calculate the size of the output from the last convolutional layer
-        self.feature_dim = self._get_conv_out(input_shape)
+        self.feature_dim = self._get_conv_out((1, HEIGHT + 4, WIDTH))
         
         self.fc = nn.Sequential(
-            nn.Linear(self.feature_dim, 512),
+            nn.Linear(self.feature_dim, 64),
             nn.ReLU(),
-            nn.Linear(512, 7)  # Setting the output dimension to 6
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 20),
+            nn.ReLU(),
+            nn.Linear(20, 7),
+            nn.ReLU(),
         )
         
     def _get_conv_out(self, shape):
@@ -87,7 +82,6 @@ class TetrisModel(nn.Module):
     def forward(self, x):
         conv_out = self.conv(x).view(x.size()[0], -1)
         return self.fc(conv_out)
-
 
 class ReplayBuffer:
     def __init__(self, capacity=10000):
@@ -103,23 +97,19 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
+def update_model(state, action, reward, next_state, done):
+    state = state.unsqueeze(0)
+    next_state = next_state.unsqueeze(0)
+    action = torch.tensor([action])
+    reward = torch.tensor([reward])
+    done = torch.tensor([done], dtype=torch.float32)
 
-def train_model():
-    if len(replay_buffer) < BATCH_SIZE:
-        return
-    state, action, reward, next_state, done = replay_buffer.sample(BATCH_SIZE)
     if CUDA:
-        state = torch.stack(state).to('cuda:0')
-        next_state = torch.stack(next_state).to('cuda:0')
-        action = torch.tensor(action).to('cuda:0')
-        reward = torch.tensor(reward).to('cuda:0')
-        done = torch.tensor(done).to('cuda:0')
-    else:
-        state = torch.stack(state)
-        next_state = torch.stack(next_state)
-        action = torch.tensor(action)
-        reward = torch.tensor(reward)
-        done = torch.tensor(done)
+        state = state.to('cuda:0')
+        next_state = next_state.to('cuda:0')
+        action = action.to('cuda:0')
+        reward = reward.to('cuda:0')
+        done = done.to('cuda:0')
         
     current_q = model(state).gather(1, action.unsqueeze(1))
     max_next_q = model(next_state).max(1)[0].detach()
@@ -132,19 +122,64 @@ def train_model():
     
     return loss
 
-def board_to_state(board):
-    state = [[1 if cell != 0 else 0 for cell in row] for row in board]
-    state_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0) # [32, 1, HEIGHT, WIDTH]
+def train_model():
+    if len(replay_buffer) < BATCH_SIZE:
+        return
+    state, action, reward, next_state, done = replay_buffer.sample(BATCH_SIZE)
+    
+    state = torch.stack(state)
+    next_state = torch.stack(next_state)
+    action = torch.tensor(action)
+    reward = torch.tensor(reward)
+    done = torch.tensor(done, dtype=torch.float32)
+
+    if CUDA:
+        state = state.to('cuda:0')
+        next_state = next_state.to('cuda:0')
+        action = action.to('cuda:0')
+        reward = reward.to('cuda:0')
+        done = done.to('cuda:0')
+        
+    current_q = model(state).gather(1, action.unsqueeze(1))
+    max_next_q = model(next_state).max(1)[0].detach()
+    expected_q = reward + (1 - done) * GAMMA * max_next_q
+
+    loss = criterion(current_q, expected_q.unsqueeze(1))
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    return loss
+
+def board_to_state(board, next_piece):
+    state_flattened = [1 if cell != 0 else 0 for row in board for cell in row]
+    
+    _, next_shape = next_piece
+    next_piece_grid = [[0] * 4 for _ in range(4)]
+    for i in range(len(next_shape)):
+        for j in range(len(next_shape[i])):
+            if next_shape[i][j] == 1:
+                next_piece_grid[i][j] = 1
+    next_piece_flattened = [cell for row in next_piece_grid for cell in row]
+    
+    combined_state = state_flattened + next_piece_flattened
+    
+    target_size = (HEIGHT + 4) * WIDTH
+    padding = [0] * (target_size - len(combined_state))
+    padded_combined_state = combined_state + padding
+    
+    assert len(padded_combined_state) == target_size, f"Expected padded_combined_state to have {target_size} elements, but got {len(padded_combined_state)}"
+
+    state_tensor = torch.tensor(padded_combined_state, dtype=torch.float32).view(1, HEIGHT + 4, WIDTH)
+    
     return state_tensor
 
 def choose_action(model, state, epsilon):
     actions = [0, 1, 2, 3, 4, 5, 6]
 
     if random.random() < epsilon:
-        # Exploration: choose a random action
         return random.choice(actions)
     else:
-        # Exploitation: choose the best action according to the model
         with torch.no_grad():
             if CUDA:
                 q_values = model(state.to('cuda:0'))
@@ -153,23 +188,46 @@ def choose_action(model, state, epsilon):
             action_index = torch.argmax(q_values).item()
             return actions[action_index]
 
-def reward_function(board, lines_cleared):
-    # Simple reward constants
-    background_reward = -1
-    line_clear_reward = 10  # Reward per line cleared
-    game_over_penalty = -100  # Large penalty for ending the game
-    
-    # Calculate rewards and penalties
-    reward = lines_cleared * line_clear_reward
-    if reward == 0:
-        reward += -1
-    
-    # Check for game over state to apply a significant penalty
-    if is_game_over():
-        reward += game_over_penalty
-    
-    return reward
+def reward_function(grid, lines_cleared):
+    line_clear_reward = 10.0  # Reward per line cleared
+    max_height_penalty_factor = 0.1  # Penalty factor for height
+    compactness_bonus_factor = 0.3  # Max bonus factor for compactness, could be less based on actual compactness
 
+    # Initialize metrics
+    filled_cells = 0
+    min_x, max_x = WIDTH, -1
+    min_y, max_y = HEIGHT, -1
+    max_height = 0
+
+    # Calculate filled cells, bounding rectangle, and max height
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            if grid[y][x] != 0:
+                filled_cells += 1
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
+                min_y = min(min_y, y)
+                max_y = max(max_y, y)
+                current_height = HEIGHT - y
+                if current_height > max_height:
+                    max_height = current_height
+
+    # Compactness and area calculations
+    compactness = 0
+    if filled_cells > 0:
+        bounding_area = (max_x - min_x + 1) * (max_y - min_y + 1)
+        compactness = filled_cells / bounding_area
+        compactness = min(compactness, 1.0)  # Ensure compactness does not exceed 1
+
+    # Calculate reward components
+    line_clear_component = lines_cleared * line_clear_reward
+    height_penalty_component = (max_height / HEIGHT) * max_height_penalty_factor
+    compactness_component = compactness * compactness_bonus_factor
+
+    # Combine components to get the final reward
+    reward = line_clear_component + compactness_component - height_penalty_component
+
+    return reward
 
 
 def can_place(piece, x, y):
@@ -186,7 +244,6 @@ def can_place(piece, x, y):
                     return False
     return True
 
-
 def place_piece(piece, x, y):
     piece_id, shape = piece
     for row in range(len(shape)):
@@ -196,43 +253,37 @@ def place_piece(piece, x, y):
 
 def flash_game_over():
     pygame.mixer.music.stop()
-    for y in range(0, HEIGHT, 2):  # Iterate over lines two at a time
-        # Flash the lines
+    for y in range(0, HEIGHT, 2):
         for line in range(y, min(y + 2, HEIGHT)):
             w.move(line, 0)
             for x in range(WIDTH):
-                w.addstr(BLOCK, curses.color_pair(0))  # Set to default color
+                w.addstr(BLOCK, curses.color_pair(0))
         w.refresh()
-        time.sleep(0.1)  # Short pause for the flash effect
+        time.sleep(0.1)
 
-        # Clear the lines
         for line in range(y, min(y + 2, HEIGHT)):
             w.move(line, 0)
             for x in range(WIDTH):
-                w.addstr("   ", curses.color_pair(0))  # Clear the blocks
+                w.addstr("   ", curses.color_pair(0))
         w.refresh()
-        time.sleep(0.01)  # Another short pause
-
-
+        time.sleep(0.01)
 
 def flash_lines(lines_to_flash):
-    for _ in range(3):  # Flash 3 times
+    for _ in range(3):
         for y in lines_to_flash:
             w.move(y, 0)
             for x in range(WIDTH):
-                w.addstr(BLOCK, curses.color_pair(0))  # Set to default color (usually white on black)
-                
+                w.addstr(BLOCK, curses.color_pair(0))
         w.refresh()
-        time.sleep(0.1)  # Pause for 100ms
+        time.sleep(0.1)
        
         for y in lines_to_flash:
             w.move(y, 0)
             for x in range(WIDTH):
-                w.addstr("   ", curses.color_pair(0))  # Clear the blocks
+                w.addstr("   ", curses.color_pair(0))
         w.refresh()
-        time.sleep(0.1)  # Pause for 100ms
+        time.sleep(0.1)
 
-        
 def clear_lines():
     global score, lines_cleared, fall_speed, lines_cleared_at_once
     lines_to_clear = [i for i, row in enumerate(grid) if all(cell != 0 for cell in row)]
@@ -267,18 +318,16 @@ def swap_piece():
     global current_piece, next_piece, current_x, current_y, can_swap
     if can_swap:
         current_piece, next_piece = next_piece, current_piece
-        current_x = (WIDTH - len(current_piece[1][0])) // 2  # Reset to the top-middle position
-        current_y = 0  # Reset to the top of the grid
+        current_x = (WIDTH - len(current_piece[1][0])) // 2
+        current_y = 0
         can_swap = False
 
 def draw_next_piece(piece, start_x, start_y):
     piece_id, shape = piece
 
-    # Get the dimensions of the shape
     shape_height = len(shape)
     shape_width = len(shape[0])
 
-    # Calculate the centered starting positions
     center_y = (7 - shape_height) // 2
     center_x = (7 - shape_width) // 2
 
@@ -292,9 +341,8 @@ def draw_next_piece(piece, start_x, start_y):
                 w.addstr(start_y + y, start_x + x * len(BLOCK), EMPTY)
     w.refresh()
 
-
 def rotate_piece(piece):
-    global current_x, current_y  # Access the global variables directly
+    global current_x, current_y
 
     _, shape = piece
 
@@ -303,20 +351,15 @@ def rotate_piece(piece):
 
     rotated_shape = [list(row) for row in zip(*reversed(shape))]
 
-    # Kick data for Tetris, where each tuple represents (dx, dy)
-    # This will try current, left, right, up (for floor kick)
     kicks = [(0, 0), (-1, 0), (1, 0), (0, -1)]
 
     for dx, dy in kicks:
         if can_place((_, rotated_shape), current_x + dx, current_y + dy):
-            # Adjust the piece's x and y position directly
             current_x += dx  
             current_y += dy  
-            return (_, rotated_shape)  # return the updated piece
+            return (_, rotated_shape)
 
-    return piece  # If no adjustment works, return the original piece
-
-
+    return piece
 
 def draw_piece(piece, x, y):
     piece_id, shape = piece
@@ -325,23 +368,21 @@ def draw_piece(piece, x, y):
             if shape[row][col] == 1:
                 draw_y = y + row
                 draw_x = (x + col) * len(BLOCK)
-                if 0 <= draw_y < sh and 0 <= draw_x < sw:  # Check if within window
+                if 0 <= draw_y < sh and 0 <= draw_x < sw:
                     w.attron(curses.color_pair(piece_id))
                     w.addstr(draw_y, draw_x, BLOCK)
                     w.attroff(curses.color_pair(piece_id))
-
 
 if AI_PLAY == False:
     speed_up_counter = 0
     LOCK_DELAY_THRESHOLD = 3
     lock_delay_counter = 0
-    last_move_time = time.time()  # Initialize the last move time to the current time
+    last_move_time = time.time()
     fall_counter = 0
 
     while True:
         key = w.getch()
 
-        # Update the last move time whenever a key is pressed
         if key in [curses.KEY_RIGHT, curses.KEY_LEFT, curses.KEY_DOWN, curses.KEY_UP, ord('s'), ord(' ')]:
             last_move_time = time.time()
     
@@ -369,22 +410,20 @@ if AI_PLAY == False:
                 current_y += 1
             fall_speed = last_fall_speed
 
-
         if fall_counter >= fall_speed / 10:
             if can_place(current_piece, current_x, current_y + 1):
                 current_y += 1
                 lock_delay_counter = 0
             else:
                 lock_delay_counter += 1
-                if lock_delay_counter >= LOCK_DELAY_THRESHOLD or (time.time() - last_move_time > 0.5):  # Check if 1 second has passed since the last move
+                if lock_delay_counter >= LOCK_DELAY_THRESHOLD or (time.time() - last_move_time > 0.5):
                     place_piece(current_piece, current_x, current_y)
                     lines_cleared = clear_lines()
                     reward_function(grid, lines_cleared)
                     current_piece = None
                     lock_delay_counter = 0
-                    # Generate a new piece
                     current_piece = generate_piece()
-                    current_x = (WIDTH - len(current_piece[1][0])) // 2  # Center the piece
+                    current_x = (WIDTH - len(current_piece[1][0])) // 2
                     current_y = 0
                     can_swap = True
             fall_counter = 0
@@ -421,15 +460,14 @@ if AI_PLAY == False:
             fall_speed = last_fall_speed
 
 else:
-    # Hyperparameters
     EPISODES = 10000
-    BATCH_SIZE = 64
-    LEARNING_RATE = 0.2
-    GAMMA = 0.95
+    BATCH_SIZE = 270
+    LEARNING_RATE = 0.01
+    GAMMA = 0.96
     EPSILON_START = 1.0
     EPSILON_END = 0.01
-    EPSILON_DECAY = 0.995
-    model = TetrisModel((1, HEIGHT, WIDTH))
+    EPSILON_DECAY = 0.997
+    model = TetrisModel((1, HEIGHT + 4, WIDTH))
     try:
         model.load_state_dict(torch.load('model_state_dict.pth'))
     except Exception as e:
@@ -440,11 +478,27 @@ else:
     criterion = nn.MSELoss()
     replay_buffer = ReplayBuffer()
     epsilon = EPSILON_START
+
+    losses = []
+    fig, ax = plt.subplots()
+    ax.set_title('Real-time Loss Plot')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Loss')
+    line, = ax.plot([], [], 'r-')
+
+    def update_plot(frame):
+        line.set_data(range(len(losses)), losses)
+        ax.relim()
+        ax.autoscale_view()
+        return line,
+
+    ani = FuncAnimation(fig, update_plot, blit=True)
+    plt.show(block=False)
+
     for i in range(EPISODES):
-
-
-
-        # Reset the game state
+        if i % 100 == 0:
+            torch.save(model.state_dict(), f'model_checkpoint_{i}.pth')
+            print(f"Model saved at episode {i}")
         grid = [[0] * WIDTH for _ in range(HEIGHT)]
         current_piece = random.choice(SHAPES)
         current_x = WIDTH // 2
@@ -461,55 +515,50 @@ else:
         speed_up_counter = 0
         LOCK_DELAY_THRESHOLD = 3
         lock_delay_counter = 0
-        last_move_time = time.time()  # Initialize the last move time to the current time
+        last_move_time = time.time()
 
         while True:
-            state = board_to_state(grid)
+            state = board_to_state(grid, next_piece)
             key = choose_action(model, state, epsilon)
 
-
-            # Update the last move time whenever a key is pressed
             if key in [5, 3, 2, 1]:
                 last_move_time = time.time()
     
-
-            if key == 0: # Go right
+            if key == 0:
                 if can_place(current_piece, current_x + 1, current_y):
                     current_x += 1
-            elif key == 1: # Go left
+            elif key == 1:
                 if can_place(current_piece, current_x - 1, current_y):
                     current_x -= 1
-            elif key == 2: # Rotate piece
+            elif key == 2:
                 rotated_piece = rotate_piece(current_piece)
                 if can_place(rotated_piece, current_x, current_y):
                     current_piece = rotated_piece
-            elif key == 3: # Soft-drop
+            elif key == 3:
                 fall_speed += -90
                 speed_up_counter = 0
                 fall_speed += 90
-            elif key == 4: # Switch piece
+            elif key == 4:
                 swap_piece()
-            elif key == 5: # Hard-drop
+            elif key == 5:
                 while can_place(current_piece, current_x, current_y + 1):
                     current_y += 1
                 fall_speed = last_fall_speed
 
-            # if fall_counter >= fall_speed / 10:
             if 1 == 1:
                 if can_place(current_piece, current_x, current_y + 1):
                     current_y += 1
                     lock_delay_counter = 0
                 else:
                     lock_delay_counter += 1
-                    if lock_delay_counter >= LOCK_DELAY_THRESHOLD or (time.time() - last_move_time > 0.5):  # Check if 1 second has passed since the last move
+                    if lock_delay_counter >= LOCK_DELAY_THRESHOLD or (time.time() - last_move_time > 0.5):
                         place_piece(current_piece, current_x, current_y)
                         lines_cleared = clear_lines()
                         reward = reward_function(grid, lines_cleared)
                         current_piece = None
                         lock_delay_counter = 0
-                        # Generate a new piece
                         current_piece = generate_piece()
-                        current_x = (WIDTH - len(current_piece[1][0])) // 2  # Center the piece
+                        current_x = (WIDTH - len(current_piece[1][0])) // 2
                         current_y = 0
                         can_swap = True
                     fall_counter = 0
@@ -538,31 +587,30 @@ else:
                 next_piece_display_x = next_piece_label_x
                 next_piece_display_y = next_piece_label_y + 2
                 draw_next_piece(next_piece, next_piece_display_x, next_piece_display_y)
-                # w.addstr(sh - 1, 0, "Score: " + str(score))
                 w.addstr(sh - 1, 0, "Reward: " + str(reward))
                 w.refresh()
                 fall_counter += 1
 
-                if key != curses.KEY_DOWN:
+                if key != 3:
                     fall_speed = last_fall_speed
 
                 reward = reward_function(grid, lines_cleared)
 
                 last_lines_cleared = lines_cleared
 
-                # Store this experience in the replay buffer
-                next_state = board_to_state(grid)
+                next_state = board_to_state(grid, next_piece)
                 replay_buffer.push(state, key, reward, next_state, is_game_over())
 
-                # Train the model
-                loss = train_model()
-                w.addstr(sh - 2, 0, "Loss: " + str(loss))
-                w.refresh()
+                loss = update_model(state, key, reward, next_state, is_game_over())
+                losses.append(loss.item())
+                line.set_data(range(len(losses)), losses)
+                plt.draw()
+                plt.pause(0.01)
 
                 if is_game_over():
                     epsilon = max(EPSILON_END, epsilon * EPSILON_DECAY)
                     train_model()
-
                     break
+
     torch.save(model.state_dict(), 'model_state_dict.pth')
     print("Saved model in 'model_state_dict.pth'")
